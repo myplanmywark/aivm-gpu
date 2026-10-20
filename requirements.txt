@@ -1,0 +1,13 @@
+torch==2.5.1
+diffusers>=0.41,<1
+transformers==4.48.0
+accelerate==1.2.1
+sentencepiece==0.2.0
+protobuf==5.29.2
+boto3==1.35.90
+Pillow==11.0.0
+redis==5.2.1
+numpy<2
+fastapi>=0.115,<1
+uvicorn[standard]>=0.32,<1
+vastai            # PyWorker agent (pin to latest at build time)
