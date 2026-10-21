@@ -1,17 +1,9 @@
 """
 AI Video Maker — Vast.ai Serverless MODEL SERVER
 ================================================
-FastAPI service that runs LTX-2.3 (video + audio) on the GPU instance.
-Vast's PyWorker agent (pyworker.py) proxies endpoint requests to this app.
-
-Routes (called by the backend through the Vast endpoint proxy):
-  POST /generate {job_id, prompt}
-  POST /extend   {job_id, prompt, prev_r2_key}
-  POST /story    {job_id, scenes: [...]}
-
-Every route runs the generation synchronously, uploads the result to
-Cloudflare R2, reports progress to Upstash Redis, and returns
-{"r2_key": ..., "duration": ...}.
+MODEL_FAMILY env:
+  "ltx1" (अभी active) — LTX-Video 2B Distilled: तेज़, 24GB-class GPUs के लिए
+  "ltx2"              — LTX-2.3: full quality + audio (बड़े GPUs के लिए)
 """
 
 from __future__ import annotations
@@ -27,15 +19,21 @@ from fastapi import FastAPI
 from PIL import Image
 
 # ---------------------------------------------------------------------------
-# Config (env — set in the Vast template)
+# Config
 # ---------------------------------------------------------------------------
-MODEL_ID = os.environ.get("LTX_MODEL_ID", "diffusers/LTX-2.3-Diffusers")
+MODEL_FAMILY = os.environ.get("MODEL_FAMILY", "ltx1").strip().lower()
+MODEL_ID = os.environ.get(
+    "LTX_MODEL_ID",
+    "Lightricks/LTX-Video" if MODEL_FAMILY == "ltx1"
+    else "diffusers/LTX-2.3-Diffusers",
+)
+VARIANT = os.environ.get("LTX_VARIANT", "").strip() or None
 STEPS = int(os.environ.get("LTX_STEPS", "20"))
 GUIDANCE = float(os.environ.get("LTX_GUIDANCE", "3.0"))
 
 WIDTH, HEIGHT, FPS = 768, 480, 24
-BASE_FRAMES = 97          # 6*16+1 = 12*8+1
-EXTEND_FRAMES = 113       # 7*16+1 = 14*8+1
+BASE_FRAMES = 97
+EXTEND_FRAMES = 113 if MODEL_FAMILY == "ltx2" else 121
 CROSSFADE_SECONDS = 0.3
 
 NEGATIVE_PROMPT = (
@@ -45,8 +43,7 @@ NEGATIVE_PROMPT = (
 
 TMP_ROOT = Path("/tmp/aivm")
 
-# Optional shared-secret: WORKER_KEY set hone par har request me
-# "X-AIVM-KEY" header hona zaroori (strangers GPU burn na kar payen)
+# Optional shared-secret: WORKER_KEY set hone par X-AIVM-KEY header zaroori
 WORKER_KEY = os.environ.get("WORKER_KEY", "").strip()
 
 app = FastAPI(title="aivm-model-server")
@@ -136,31 +133,52 @@ def crossfade_stitch(a: Path, b: Path, out: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# model load (once, at server start)
+# model load (once)
 # ---------------------------------------------------------------------------
 @app.on_event("startup")
 def load_model() -> None:
-    from diffusers import LTX2ImageToVideoPipeline, LTX2Pipeline
-
     os.environ.setdefault("HF_HOME", "/workspace/hf")
-    print("Model load starting:", MODEL_ID, flush=True)
+    print(f"Model load starting: family={MODEL_FAMILY} id={MODEL_ID}", flush=True)
 
-    t2v = LTX2Pipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
-    i2v = LTX2ImageToVideoPipeline.from_pipe(t2v)
-    t2v.to("cuda")
-    i2v.to("cuda")
+    if MODEL_FAMILY == "ltx1":
+        from diffusers import LTXImageToVideoPipeline, LTXPipeline
+        from transformers import T5EncoderModel
+
+        # shared T5 encoder — dono pipelines ka total VRAM ~half rehta hai
+        text_encoder = T5EncoderModel.from_pretrained(
+            MODEL_ID, subfolder="text_encoder", torch_dtype=torch.bfloat16
+        )
+        load_kwargs: dict = {
+            "torch_dtype": torch.bfloat16,
+            "text_encoder": text_encoder,
+        }
+        if VARIANT:
+            load_kwargs["variant"] = VARIANT
+
+        t2v = LTXPipeline.from_pretrained(MODEL_ID, **load_kwargs)
+        i2v = LTXImageToVideoPipeline.from_pretrained(MODEL_ID, **load_kwargs)
+        t2v.to("cuda")
+        i2v.to("cuda")
+        audio_sr = None
+    else:
+        from diffusers import LTX2ImageToVideoPipeline, LTX2Pipeline
+
+        t2v = LTX2Pipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
+        i2v = LTX2ImageToVideoPipeline.from_pipe(t2v)
+        t2v.to("cuda")
+        i2v.to("cuda")
+        try:
+            audio_sr = int(t2v.vocoder.config.output_sampling_rate)
+        except Exception:
+            audio_sr = 24000
+
     for pipe in (t2v, i2v):
         try:
             pipe.enable_vae_tiling()
         except Exception:
             pass
 
-    try:
-        sr = int(t2v.vocoder.config.output_sampling_rate)
-    except Exception:
-        sr = 24000
-
-    _state.update(t2v=t2v, i2v=i2v, audio_sr=sr)
+    _state.update(t2v=t2v, i2v=i2v, audio_sr=audio_sr)
     print("Model ready — accepting jobs", flush=True)  # PyWorker on_load marker
 
 
@@ -171,34 +189,46 @@ def generate_clip(prompt: str, num_frames: int, image=None):
     seed = random.randint(0, 2**31 - 1)
     generator = torch.Generator(device="cuda").manual_seed(seed)
     pipe = _state["i2v"] if image is not None else _state["t2v"]
-    out = pipe(
+    common = dict(
         prompt=prompt,
         negative_prompt=NEGATIVE_PROMPT,
         width=WIDTH,
         height=HEIGHT,
-        num_frames=num_frames,
-        frame_rate=FPS,
         num_inference_steps=STEPS,
         guidance_scale=GUIDANCE,
         generator=generator,
-        **({"image": image} if image is not None else {}),
     )
+    if MODEL_FAMILY == "ltx2":
+        out = pipe(
+            num_frames=num_frames,
+            frame_rate=FPS,
+            **common,
+            **({"image": image} if image is not None else {}),
+        )
+        audio = getattr(out, "audio", None)
+        if audio is not None:
+            try:
+                audio = audio[0]
+            except Exception:
+                audio = None
+    else:
+        out = pipe(
+            num_frames=num_frames,
+            **common,
+            **({"image": image} if image is not None else {}),
+        )
+        audio = None
+
     frames = out.frames
     if frames and isinstance(frames[0], (list, tuple)):
         frames = frames[0]
     if not frames:
         raise RuntimeError("Pipeline returned no frames")
-    audio = getattr(out, "audio", None)
-    if audio is not None:
-        try:
-            audio = audio[0]
-        except Exception:
-            audio = None
     return frames, audio
 
 
 def export_clip(frames, audio, path: Path) -> None:
-    if audio is not None:
+    if MODEL_FAMILY == "ltx2" and audio is not None:
         try:
             from diffusers.utils.export_utils import encode_video
 
@@ -317,4 +347,4 @@ def route_story(payload: dict):
 
 @app.get("/health")
 def health():
-    return {"ok": "Model ready" in str(_state) or bool(_state)}
+    return {"ok": bool(_state)}
